@@ -1,0 +1,427 @@
+# # Wolf AI
+
+> 🧠 Multiplayer Real-time AI + Human Werewolf Game System
+
+---
+
+# ⚠️ Architecture Authority (CRITICAL)
+
+This project is strictly governed by:
+
+* [/docx/00-FROZEN-CONTRACT.md](/docx/00-FROZEN-CONTRACT.md) (PRIMARY SOURCE OF TRUTH)
+* [/docx/01-GAME-STATE-MACHINE-CONTRACT.md](docx/01-GAME-STATE-MACHINE-CONTRACT.md) 
+* Supabase Edge Functions (SERVER AUTHORITY)
+* PostgreSQL schema (IMMUTABLE BASELINE)
+
+### Conflict Resolution Rule
+
+```text
+Frozen Architecture Contract overrides EVERYTHING.
+```
+
+---
+
+# 🪙 Golden Rule (MOST IMPORTANT)
+
+```text
+If a decision affects game outcome, it MUST go through Edge Functions.
+```
+
+---
+
+# 🏗 System Architecture
+
+## 1. Client Layer (Next.js)
+
+Responsible ONLY for:
+
+* UI rendering
+* User input collection
+* Realtime message display
+
+❌ Must NOT:
+
+* Compute game logic
+* Access roles of other players
+* Decide game outcomes
+
+---
+
+## 2. Server Layer (Supabase Edge Functions)
+
+This is the **ONLY authoritative game engine**:
+
+Responsible for:
+
+* Game state transitions (`game_state`)
+* Vote resolution
+* Role assignment
+* AI decision execution
+* Timeout handling
+* Reconnect recovery
+
+---
+
+## 3. Data Layer (PostgreSQL)
+
+Responsible ONLY for persistence:
+
+* `game_state` (single source of truth)
+* `game_members`
+* `game_member_profiles`
+* `game_member_state`
+* `channels`
+* `game_events` (replay only)
+* `messages`
+
+❌ Database MUST NOT contain business logic
+
+---
+
+## 4. Realtime Layer (Supabase Realtime)
+
+Used ONLY for:
+
+* Message broadcasting
+* State notifications
+* UI sync updates
+
+❌ Not allowed for:
+
+* Decision making
+* Game logic
+* Authority resolution
+
+---
+
+# ⚠️ Development Rules (MANDATORY)
+
+Any developer or Codex must follow:
+
+## ❌ Forbidden Actions
+
+* Modify existing schema without a new migration file
+* Implement game logic in frontend (Next.js)
+* Bypass Edge Functions for state transitions
+* Query sensitive game state directly from client
+* Expose AI identity in runtime
+* Create AI in `auth.users` or `profiles`
+* Infer game state from messages or events
+* Modify `seat_no` after game start
+
+---
+
+## ✅ Allowed Actions
+
+* Add new migration files (non-breaking only)
+* Extend Edge Functions
+* Add UI components
+* Add new AI personalities (server-side only)
+* Extend event types (game_events)
+
+---
+
+# 🧠 Core Game Model
+
+## Game Identity
+
+* A Room can have multiple Games:
+
+```text
+Room 1 : N Games
+```
+
+* A Game is an immutable runtime instance
+
+---
+
+## Game State Source of Truth
+
+```text
+game_state.phase is the ONLY truth
+```
+
+Allowed phases:
+
+```text
+waiting
+night
+day
+vote
+settlement
+ended
+```
+
+---
+
+## Seat System (CRITICAL)
+
+Each game stores immutable seat identity in:
+
+```text
+game_members
+```
+
+Rules:
+
+* `game_members.seat_no` is FIXED per game
+* `game_members.user_id` is NULL for AI seats
+* AI players also occupy seats
+* role/personality live in `game_member_profiles`
+* alive/death state lives in `game_member_state`
+* deaths store `death_reason`, `death_round`, and optional `killed_by_member_id`
+* `game_member_profiles` and `game_member_state` do not store `game_id`; resolve ownership through `member_id -> game_members`
+
+---
+
+## AI System Rules
+
+AI:
+
+* Exists ONLY in `game_members`
+* Has NO auth account
+* Has NO profile
+* Has NO special privileges
+
+AI must:
+
+* Speak like human players
+* Vote like human players
+* Use skills like human players
+* Not be identifiable during runtime
+
+---
+
+## AI Behavior Model
+
+AI receives:
+
+* compressed chat history
+* game_state snapshot
+* visible messages
+* event summaries
+
+AI output MUST be structured:
+
+```json
+{
+  "action": "speak | vote | skill | pass",
+  "target": 2,
+  "content": "message text"
+}
+```
+
+---
+
+# ⏱ Timeout System
+
+Rules:
+
+* Each action has a time limit
+* After timeout:
+
+```text
++3 seconds grace period
+→ default action applied
+→ lock further input
+```
+
+Default actions:
+
+* Vote: abstain
+* Night: no action
+* Speak: skip
+
+❌ After timeout:
+
+* NO further actions allowed
+
+---
+
+# 🔐 Concurrency Model
+
+All critical operations MUST use:
+
+```sql
+pg_advisory_xact_lock(hashtext(game_id::text))
+```
+
+Used in:
+
+* start_game
+* next_phase
+* process_vote
+* ai_turn
+* timeout_handler
+
+The database also enforces `one_active_game_per_room` on `games(room_id) where ended_at is null`.
+
+Open actions are unique by `(game_id, actor_member_id, action_type, phase, round_no)` so one action type can be retargeted without blocking another valid action type.
+`game_actions.request_id` is the only idempotency key; there is no separate request ledger table.
+
+---
+
+# 📡 Realtime Rules
+
+Channels:
+
+* lobby
+* public
+* wolf
+* dead
+* system
+
+Rules:
+
+* MUST be `private: true`
+* topic MUST be `room:{room_id}:{channel}`
+* MUST be RLS protected
+* MUST NOT expose raw DB state
+* lobby channels are room-level (`game_id = null`); system can be room-level or game-level
+* active-game channels are unique by `game_id + name`
+
+---
+
+# 🧾 Data Model Summary
+
+## Core Tables
+
+* profiles (identity only)
+* rooms (lobby config)
+* room_members (membership)
+* games (runtime instance)
+* game_state (truth source)
+* game_members (immutable seat identity)
+* game_member_profiles (initial role/personality data)
+* game_member_state (runtime alive/death state)
+* channels (private realtime routing)
+* game_events (replay only)
+* messages (chat layer)
+
+---
+
+# 🚫 Hard Security Constraints
+
+The system MUST NEVER allow:
+
+* Revealing AI identity during game
+* Exposing full roles of other players
+* Client-side game resolution
+* Direct DB-driven game logic
+* Seat reassignment after game start
+
+---
+
+# 🔁 Edge Functions (Authoritative Engine)
+
+Required functions:
+
+* `start_game`
+* `next_phase`
+* `process_vote`
+* `ai_turn`
+* `timeout_handler`
+* `reconnect`
+
+All must:
+
+* acquire advisory lock
+* validate game_state
+* write result to DB
+* emit realtime events
+
+---
+
+# 📊 game_events Rule
+
+Used ONLY for:
+
+* replay
+* post-game analysis
+
+❌ Must NOT be used for:
+
+* real-time decisions
+* state derivation
+
+---
+
+# 🧩 AI Personality System
+
+AI can have:
+
+* aggressive
+* logical
+* chaotic
+* deceptive
+* silent
+
+Personality affects:
+
+* speaking frequency
+* voting tendency
+* suspicion behavior
+
+---
+
+# 🧪 MVP Scope
+
+## V1
+
+* Room system
+* Game lifecycle
+* AI players
+* Voting system
+* Night skills
+* Realtime chat
+* Edge Function engine
+* RLS enforcement
+
+---
+
+## V2
+
+* Replay system
+* AI personality marketplace
+* Ranking system
+* Advanced roles
+* Match analytics
+
+---
+
+# ⚠️ Final Reminder
+
+This is NOT a normal web app.
+
+It is:
+
+```text
+A real-time distributed game state machine with AI agents
+```
+
+---
+
+# Local Development
+
+Required browser env:
+
+```text
+NEXT_PUBLIC_SUPABASE_URL
+NEXT_PUBLIC_SUPABASE_ANON_KEY
+```
+
+Required Edge Function env:
+
+```text
+SUPABASE_DB_URL
+```
+
+Run order:
+
+```bash
+npx supabase db push
+npx supabase functions serve
+npm run dev
+```
+
+The Edge Functions use `SUPABASE_DB_URL` for direct Postgres transactions so `pg_advisory_xact_lock(hashtext(game_id::text))` is held across the full state transition.
