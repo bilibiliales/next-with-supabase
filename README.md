@@ -219,17 +219,21 @@ Rules:
 
 * Supabase Cron invokes `game_tick` every 30 seconds
 * Clients never advance game state
-* `game_tick` drains pending AI actions before checking the phase deadline
-* If `deadline_at <= now()`, `game_tick` calls `advanceGame(game_id)`
+* `game_tick` only scans due games: `ended_at is null` and (`deadline_at <= now()` or `phase = 'waiting'`)
+* `game_tick` uses non-blocking PostgreSQL advisory locks and skips already-locked games
+* `game_tick` calls `advanceGame(game_id)` for each active game
+* `advanceGame()` drains pending AI actions, checks `deadline_at`, resolves actions, and advances phase
 * Do not introduce polling loops or background workers inside Edge Functions
 
 ```text
-Cron(30 seconds) -> game_tick -> AI actions -> deadline check -> advanceGame -> Realtime broadcast
+Cron(30 seconds) -> game_tick -> advanceGame -> AI actions -> deadline check -> transition -> Realtime broadcast
 → default action applied
 → lock further input
 ```
 
 Manual `next_phase` exists only for development/testing and requires `ALLOW_MANUAL_PHASE_ADVANCE=true`.
+`timeout_handler` is snapshot-only; cron tick is responsible for timeout progression.
+Manual `ai_turn` is disabled unless `ALLOW_MANUAL_AI_TURN=true`.
 The scheduler pipeline above is authoritative; clients must not be required for timeout or phase progression.
 
 ❌ After timeout:
@@ -252,17 +256,18 @@ Used in:
 * game_tick
 * next_phase (debug only)
 * process_vote
-* ai_turn
-* timeout_handler (legacy wrapper)
+* ai_turn (debug only)
+* timeout_handler (snapshot only)
 
 The database also enforces `one_active_game_per_room` on `games(room_id) where ended_at is null`.
 `start_game` must lock the room row with `select ... for update` before checking `rooms.status`.
 
-Only shared `advanceGame()` may mutate `game_state.phase`. `game_tick` invokes it from Supabase Cron; `next_phase` and `timeout_handler` are wrappers and production gameplay must not depend on client-triggered requests.
+Only shared `advanceGame()` may mutate `game_state.phase`. `game_tick` invokes it from Supabase Cron; `next_phase` and `ai_turn` are debug-only, and `timeout_handler` is snapshot-only.
 
 Open actions are unique by `(game_id, actor_member_id, action_type, phase, round_no)` so one action type can be retargeted without blocking another valid action type.
 `game_actions.request_id` is the only idempotency key; there is no separate request ledger table.
 AI turns must also write through `game_actions` before producing messages, votes, or skills.
+AI request IDs must be deterministic per `game_id + member_id + action_type + phase + round_no`, and AI intents are logged as `ai_action_submitted` events.
 
 ---
 
@@ -325,8 +330,8 @@ Required functions:
 * `game_tick`
 * `next_phase` (debug only)
 * `process_vote`
-* `ai_turn`
-* `timeout_handler` (legacy wrapper)
+* `ai_turn` (debug only)
+* `timeout_handler` (snapshot only)
 * `reconnect`
 * `room_action` (`reset_room` for owner-only `POST_GAME -> WAITING`)
 

@@ -44,8 +44,12 @@ game_state.phase 是唯一真相
 ```text
 Only shared advanceGame() may mutate game_state.phase.
 game_tick invokes advanceGame() from Supabase Cron every 30 seconds.
+advanceGame() owns AI action draining, deadline checks, action resolution, and phase transition.
+game_tick must only scan due games: ended_at is null and (deadline_at <= now() or phase = 'waiting').
+game_tick must use a non-blocking PostgreSQL advisory transaction lock and skip locked games.
 next_phase is debug-only and requires ALLOW_MANUAL_PHASE_ADVANCE=true.
-timeout_handler is a legacy wrapper around advanceGame().
+timeout_handler is snapshot-only and must not call advanceGame().
+ai_turn is debug-only and requires ALLOW_MANUAL_AI_TURN=true.
 process_vote / process_skill / ai_turn must not advance phase.
 ```
 
@@ -267,7 +271,8 @@ create table game_events (
         'vote_resolved',
         'night_resolved',
         'phase_changed',
-        'game_ended'
+        'game_ended',
+        'ai_action_submitted'
     )),
     payload jsonb,
     created_at timestamptz default now()
@@ -357,8 +362,8 @@ start_game
 game_tick
 next_phase (debug only)
 process_vote
-ai_turn
-timeout_handler (legacy wrapper)
+ai_turn (debug only)
+timeout_handler (snapshot only)
 reconnect
 room_action.reset_room
 ```
@@ -387,7 +392,7 @@ pg_advisory_xact_lock(hashtext(game_id::text))
 * next_phase (debug only)
 * vote resolution
 * AI actions
-* timeout handler (legacy wrapper)
+* timeout handler (snapshot only)
 
 ---
 

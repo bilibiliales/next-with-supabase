@@ -158,7 +158,7 @@ create table if not exists public.game_events (
     id bigserial primary key,
     game_id uuid references public.games(id) on delete cascade,
     actor_member_id uuid references public.game_members(id) on delete set null,
-    event_type text not null check (event_type in ('game_started', 'vote_resolved', 'night_resolved', 'phase_changed', 'game_ended')),
+    event_type text not null check (event_type in ('game_started', 'vote_resolved', 'night_resolved', 'phase_changed', 'game_ended', 'ai_action_submitted')),
     payload jsonb not null default '{}'::jsonb,
     created_at timestamptz default now()
 );

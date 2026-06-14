@@ -40,6 +40,14 @@ export async function withGameLock<T>(gameId: string, work: (tx: TxClient) => Pr
   });
 }
 
+export async function tryWithGameLock<T>(gameId: string, work: (tx: TxClient) => Promise<T>): Promise<T | null> {
+  return await withTransaction(async (tx) => {
+    const rows = await tx`select pg_try_advisory_xact_lock(hashtext(${gameId}::text)) as locked`;
+    if (!rows[0]?.locked) return null;
+    return await work(tx);
+  });
+}
+
 export async function withRoomLock<T>(roomId: string, work: (tx: TxClient) => Promise<T>): Promise<T> {
   return await withTransaction(async (tx) => {
     await tx`select pg_advisory_xact_lock(hashtext(${roomId}::text))`;

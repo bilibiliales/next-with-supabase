@@ -1,7 +1,7 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { broadcastToRoom, corsHeaders, json } from "../_shared/http.ts";
-import { getSql, withGameLock } from "../_shared/db.ts";
-import { advanceGame, isDeadlineReached, runPendingAiTurns } from "../_shared/game.ts";
+import { getSql, tryWithGameLock } from "../_shared/db.ts";
+import { advanceGame } from "../_shared/game.ts";
 
 function serviceAuthorized(req: Request): boolean {
   const authHeader = req.headers.get("authorization") ?? "";
@@ -18,6 +18,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unexpected game_tick error.";
 }
 
+function sanitizeTickResult(result: Record<string, unknown>): Record<string, unknown> {
+  const publicResult = { ...result };
+  delete publicResult.ai_results;
+  return publicResult;
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (!serviceAuthorized(req)) return json({ ok: false, error: "Unauthorized game tick request." }, 401);
@@ -29,52 +35,31 @@ serve(async (req) => {
     join public.game_state gs on gs.game_id = g.id
     where g.ended_at is null
       and gs.phase <> 'ended'
+      and (
+        gs.phase = 'waiting'
+        or gs.deadline_at <= now()
+      )
     order by gs.deadline_at asc nulls last
+    limit 100
   `;
 
   const results: Record<string, unknown>[] = [];
 
   for (const game of activeGames) {
     try {
-      const result: Record<string, unknown> = await withGameLock(game.id as string, async (tx) => {
-        const ai = await runPendingAiTurns(tx, game.id as string);
-        const stateRows = await tx`
-          select gs.phase, gs.round_no, gs.deadline_at, gs.state_version, g.room_id, g.winner, g.ended_at
-          from public.game_state gs
-          join public.games g on g.id = gs.game_id
-          where gs.game_id = ${game.id}
-        `;
-        const state = stateRows[0];
-        if (!state || state.ended_at || state.phase === "ended") {
-          return {
-            game_id: game.id,
-            advanced: false,
-            reason: "inactive",
-            ai_actions: ai.actions,
-          };
-        }
-
-        if (!isDeadlineReached(state.deadline_at)) {
-          return {
-            game_id: game.id,
-            room_id: state.room_id,
-            phase: state.phase,
-            round_no: state.round_no,
-            deadline_at: state.deadline_at,
-            advanced: false,
-            reason: "deadline_not_reached",
-            ai_actions: ai.actions,
-          };
-        }
-
-        const transition = await advanceGame(tx, game.id as string);
-        return {
-          ...transition,
-          ai_actions: ai.actions,
-        };
+      const result = await tryWithGameLock(game.id as string, async (tx) => {
+        return await advanceGame(tx, game.id as string);
       });
+      if (!result) {
+        results.push({
+          game_id: game.id,
+          advanced: false,
+          reason: "locked",
+        });
+        continue;
+      }
 
-      results.push(result);
+      results.push(sanitizeTickResult(result));
 
       if (result.advanced && typeof result.room_id === "string") {
         await broadcastToRoom(result.room_id, "system", "state", {

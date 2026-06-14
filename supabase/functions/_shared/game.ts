@@ -19,9 +19,17 @@ export type AdvanceGameResult = {
   round_no: number;
   deadline_at: string | null;
   state_version: number;
+  ai_actions: number;
+  ai_results: Record<string, unknown>[];
   advanced: boolean;
   ended: boolean;
   winner: string | null;
+  reason?: string;
+};
+
+type AdvanceGameOptions = {
+  force?: boolean;
+  runAi?: boolean;
 };
 
 const AI_PERSONALITIES = ["aggressive", "logical", "chaotic", "deceptive", "silent"] as const;
@@ -47,7 +55,7 @@ export function deadlineFor(phase: Exclude<Phase, "waiting" | "ended">): string 
   return new Date(Date.now() + PHASE_SECONDS[phase] * 1000).toISOString();
 }
 
-export function isDeadlineReached(deadlineAt: string | null): boolean {
+function isDeadlineReached(deadlineAt: string | null): boolean {
   if (!deadlineAt) return false;
   return Date.now() >= new Date(deadlineAt).getTime();
 }
@@ -709,7 +717,11 @@ export async function processSkill(sql: SqlExecutor, user: AuthUser, input: Reco
   };
 }
 
-export async function advanceGame(sql: SqlExecutor, gameId: string): Promise<AdvanceGameResult> {
+export async function advanceGame(
+  sql: SqlExecutor,
+  gameId: string,
+  options: AdvanceGameOptions = {},
+): Promise<AdvanceGameResult> {
   const stateRows = await sql`
     select gs.*, g.room_id, g.winner, g.ended_at
     from public.game_state gs
@@ -730,33 +742,40 @@ export async function advanceGame(sql: SqlExecutor, gameId: string): Promise<Adv
       round_no: state.round_no,
       deadline_at: state.deadline_at,
       state_version: state.state_version,
+      ai_actions: 0,
+      ai_results: [],
       advanced: false,
       ended: previousPhase === "ended",
       winner: state.winner ?? null,
+      reason: "inactive",
     };
   }
 
-  let targetPhase: Phase = PHASE_ORDER[previousPhase];
-  let targetRound = state.round_no as number;
-  let winner: string | null = null;
+  const ai = options.runAi === false
+    ? { actions: 0, results: [] as Record<string, unknown>[] }
+    : await runPendingAiTurnsForState(sql, gameId, state);
 
-  if (previousPhase === "night") {
-    await maybeResolveNight(sql, gameId, state.round_no, true);
-    targetPhase = "day";
-  } else if (previousPhase === "day") {
-    targetPhase = "vote";
-  } else if (previousPhase === "vote") {
-    await maybeResolveVote(sql, gameId, state.round_no, true);
-    targetPhase = "settlement";
-  } else if (previousPhase === "settlement") {
-    winner = await evaluateWinner(sql, gameId);
-    targetPhase = winner ? "ended" : "night";
-    targetRound = winner ? state.round_no : state.round_no + 1;
-  } else if (previousPhase === "waiting") {
-    targetPhase = "night";
+  if (!options.force && previousPhase !== "waiting" && !isDeadlineReached(state.deadline_at)) {
+    return {
+      game_id: gameId,
+      room_id: state.room_id,
+      previous_phase: previousPhase,
+      phase: previousPhase,
+      round_no: state.round_no,
+      deadline_at: state.deadline_at,
+      state_version: state.state_version,
+      ai_actions: ai.actions,
+      ai_results: ai.results,
+      advanced: false,
+      ended: false,
+      winner: state.winner ?? null,
+      reason: "deadline_not_reached",
+    };
   }
 
-  const updated = await setPhase(sql, gameId, targetPhase, targetRound, state.state_version);
+  const transition = await resolvePhaseAndComputeTransition(sql, gameId, state);
+
+  const updated = await setPhase(sql, gameId, transition.phase, transition.roundNo, state.state_version);
   if (!updated) {
     return {
       game_id: gameId,
@@ -766,9 +785,12 @@ export async function advanceGame(sql: SqlExecutor, gameId: string): Promise<Adv
       round_no: state.round_no,
       deadline_at: state.deadline_at,
       state_version: state.state_version,
+      ai_actions: ai.actions,
+      ai_results: ai.results,
       advanced: false,
       ended: false,
       winner: state.winner ?? null,
+      reason: "state_version_changed",
     };
   }
 
@@ -780,20 +802,54 @@ export async function advanceGame(sql: SqlExecutor, gameId: string): Promise<Adv
     round_no: updated.round_no as number,
     deadline_at: updated.deadline_at as string | null,
     state_version: updated.state_version as number,
+    ai_actions: ai.actions,
+    ai_results: ai.results,
     advanced: true,
     ended: updated.phase === "ended",
-    winner,
+    winner: transition.winner,
   };
 }
 
-export async function runPendingAiTurns(sql: SqlExecutor, gameId: string) {
-  const stateRows = await sql`
-    select *
-    from public.game_state
-    where game_id = ${gameId}
-  `;
-  const state = stateRows[0];
-  if (!state || !["night", "day", "vote"].includes(state.phase)) {
+async function resolvePhaseAndComputeTransition(
+  sql: SqlExecutor,
+  gameId: string,
+  state: Record<string, unknown>,
+): Promise<{ phase: Phase; roundNo: number; winner: string | null }> {
+  const currentPhase = state.phase as Phase;
+  const currentRound = state.round_no as number;
+
+  if (currentPhase === "night") {
+    await maybeResolveNight(sql, gameId, currentRound, true);
+    return { phase: "day", roundNo: currentRound, winner: null };
+  }
+
+  if (currentPhase === "day") {
+    return { phase: "vote", roundNo: currentRound, winner: null };
+  }
+
+  if (currentPhase === "vote") {
+    await maybeResolveVote(sql, gameId, currentRound, true);
+    return { phase: "settlement", roundNo: currentRound, winner: null };
+  }
+
+  if (currentPhase === "settlement") {
+    const winner = await evaluateWinner(sql, gameId);
+    return {
+      phase: winner ? "ended" : "night",
+      roundNo: winner ? currentRound : currentRound + 1,
+      winner,
+    };
+  }
+
+  if (currentPhase === "waiting") {
+    return { phase: "night", roundNo: currentRound, winner: null };
+  }
+
+  return { phase: PHASE_ORDER[currentPhase], roundNo: currentRound, winner: null };
+}
+
+async function runPendingAiTurnsForState(sql: SqlExecutor, gameId: string, state: Record<string, unknown>) {
+  if (!["night", "day", "vote"].includes(state.phase as string)) {
     return { actions: 0, results: [] as Record<string, unknown>[] };
   }
 
@@ -813,7 +869,7 @@ export async function nextPhase(sql: SqlExecutor, user: AuthUser, input: Record<
 
   const gameId = assertUuid(input.game_id, "game_id");
   await requireRoomOwnerForGame(sql, gameId, user.id);
-  await advanceGame(sql, gameId);
+  await advanceGame(sql, gameId, { force: true });
   return await gameSnapshot(sql, gameId, user.id);
 }
 
@@ -821,21 +877,18 @@ export async function timeoutHandler(sql: SqlExecutor, user: AuthUser, input: Re
   const gameId = assertUuid(input.game_id, "game_id");
   await actingContext(sql, gameId, user.id);
 
-  const stateRows = await sql`select * from public.game_state where game_id = ${gameId}`;
-  const state = stateRows[0];
-  if (!state) throw new HttpError(404, "Game state not found.");
-  if (state.phase === "ended") {
-    return { applied: false, snapshot: await gameSnapshot(sql, gameId, user.id) };
-  }
-  if (!isDeadlineReached(state.deadline_at)) {
-    return { applied: false, snapshot: await gameSnapshot(sql, gameId, user.id) };
-  }
-
-  const transition = await advanceGame(sql, gameId);
-  return { applied: transition.advanced, transition, snapshot: await gameSnapshot(sql, gameId, user.id) };
+  return {
+    applied: false,
+    reason: "server_tick_authoritative",
+    snapshot: await gameSnapshot(sql, gameId, user.id),
+  };
 }
 
 export async function aiTurn(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
+  if (Deno.env.get("ALLOW_MANUAL_AI_TURN") !== "true") {
+    throw new HttpError(403, "Manual AI turns are disabled.");
+  }
+
   const gameId = assertUuid(input.game_id, "game_id");
   await actingContext(sql, gameId, user.id);
 
@@ -966,6 +1019,38 @@ async function pendingAiRows(sql: SqlExecutor, gameId: string, state: Record<str
   `;
 }
 
+async function deterministicRequestId(parts: unknown[]): Promise<string> {
+  const input = parts.map((part) => String(part ?? "null")).join("|");
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input)));
+  const bytes = hash.slice(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+async function recordAiActionEvent(
+  sql: SqlExecutor,
+  gameId: string,
+  actorMemberId: string,
+  requestId: string,
+  payload: Record<string, unknown>,
+) {
+  const existing = await sql`
+    select 1
+    from public.game_events
+    where game_id = ${gameId}
+      and event_type = 'ai_action_submitted'
+      and payload ->> 'request_id' = ${requestId}
+    limit 1
+  `;
+  if (existing[0]) return;
+  await recordEvent(sql, gameId, actorMemberId, "ai_action_submitted", {
+    request_id: requestId,
+    ...payload,
+  });
+}
+
 async function applyAiTurn(
   sql: SqlExecutor,
   gameId: string,
@@ -973,16 +1058,28 @@ async function applyAiTurn(
   state: Record<string, unknown>,
 ) {
   const action = await decideAiAction(sql, gameId, ai, state);
+  const actorMemberId = ai.id as string;
+  const roundNo = state.round_no as number;
+  const actorSeatNo = ai.seat_no as number;
 
   if (action.action === "speak") {
+    const requestId = await deterministicRequestId(["ai", gameId, actorMemberId, "speak", "day", roundNo]);
     const roomRows = await sql`select room_id from public.games where id = ${gameId}`;
     const roomId = roomRows[0].room_id;
     const channelId = await ensureChannel(sql, roomId, gameId, action.channel as Channel);
-    const actionResult = await upsertMemberAction(sql, gameId, ai.id as string, "speak", "day", state.round_no as number, action.target ?? null, {
+    const actionResult = await upsertMemberAction(sql, gameId, actorMemberId, "speak", "day", roundNo, action.target ?? null, {
       ai: true,
       channel: action.channel,
       content: action.content,
-    }, crypto.randomUUID());
+    }, requestId);
+    await recordAiActionEvent(sql, gameId, actorMemberId, requestId, {
+      action_type: "speak",
+      phase: "day",
+      round_no: roundNo,
+      seat_no: actorSeatNo,
+      target_seat_no: action.target ?? null,
+      channel: action.channel,
+    });
     if (actionResult.status === "created") {
       await sql`
         insert into public.messages (room_id, game_id, channel_id, sender_id, sender_member_id, seat_no, content, metadata)
@@ -990,11 +1087,37 @@ async function applyAiTurn(
       `;
     }
   } else if (action.action === "vote") {
-    await upsertMemberAction(sql, gameId, ai.id as string, "vote", "vote", state.round_no as number, action.target ?? null, { ai: true }, crypto.randomUUID());
+    const requestId = await deterministicRequestId(["ai", gameId, actorMemberId, "vote", "vote", roundNo]);
+    await upsertMemberAction(sql, gameId, actorMemberId, "vote", "vote", roundNo, action.target ?? null, { ai: true }, requestId);
+    await recordAiActionEvent(sql, gameId, actorMemberId, requestId, {
+      action_type: "vote",
+      phase: "vote",
+      round_no: roundNo,
+      seat_no: actorSeatNo,
+      target_seat_no: action.target ?? null,
+    });
   } else if (action.action === "skill") {
-    await upsertMemberAction(sql, gameId, ai.id as string, action.skill ?? "pass", "night", state.round_no as number, action.target ?? null, { ai: true }, crypto.randomUUID());
+    const actionType = action.skill ?? "pass";
+    const requestId = await deterministicRequestId(["ai", gameId, actorMemberId, actionType, "night", roundNo]);
+    await upsertMemberAction(sql, gameId, actorMemberId, actionType, "night", roundNo, action.target ?? null, { ai: true }, requestId);
+    await recordAiActionEvent(sql, gameId, actorMemberId, requestId, {
+      action_type: actionType,
+      phase: "night",
+      round_no: roundNo,
+      seat_no: actorSeatNo,
+      target_seat_no: action.target ?? null,
+    });
   } else {
-    await upsertMemberAction(sql, gameId, ai.id as string, "pass", state.phase as string, state.round_no as number, null, { ai: true }, crypto.randomUUID());
+    const phase = state.phase as string;
+    const requestId = await deterministicRequestId(["ai", gameId, actorMemberId, "pass", phase, roundNo]);
+    await upsertMemberAction(sql, gameId, actorMemberId, "pass", phase, roundNo, null, { ai: true }, requestId);
+    await recordAiActionEvent(sql, gameId, actorMemberId, requestId, {
+      action_type: "pass",
+      phase,
+      round_no: roundNo,
+      seat_no: actorSeatNo,
+      target_seat_no: null,
+    });
   }
 
   return {

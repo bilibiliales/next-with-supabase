@@ -153,9 +153,13 @@ Client-triggered next_phase is debug-only.
 
 Only shared advanceGame() may mutate game_state.phase.
 game_tick invokes advanceGame() from Supabase Cron every 30 seconds.
+advanceGame() owns AI action draining, deadline checks, action resolution, and phase transition.
+game_tick must only scan due games: ended_at is null and (deadline_at <= now() or phase = 'waiting').
+game_tick must use a non-blocking PostgreSQL advisory transaction lock and skip locked games.
 next_phase is debug-only and requires ALLOW_MANUAL_PHASE_ADVANCE=true.
 process_vote / process_skill / ai_turn write actions only.
-timeout_handler is a legacy wrapper around advanceGame().
+timeout_handler is snapshot-only and must not call advanceGame().
+ai_turn is debug-only and requires ALLOW_MANUAL_AI_TURN=true.
 ```
 
 ---
@@ -235,7 +239,7 @@ pg_advisory_lock(game_id_hash)
 - game_tick
 - next_phase (debug only)
 - process_vote
-- ai_turn
+- ai_turn (debug only)
 - start_game
 ```
 
