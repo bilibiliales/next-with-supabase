@@ -131,6 +131,7 @@ ENDED
 - 游戏结束
 - 写 game_results
 - 解锁复盘模式
+- 房主可调用 reset_room 将房间从 POST_GAME 重置为 WAITING
 ```
 
 ---
@@ -146,6 +147,17 @@ ENDED
 next_phase()
 ```
 
+```text
+Authoritative runtime path: Supabase Cron -> game_tick -> advanceGame().
+Client-triggered next_phase is debug-only.
+
+Only shared advanceGame() may mutate game_state.phase.
+game_tick invokes advanceGame() from Supabase Cron every 30 seconds.
+next_phase is debug-only and requires ALLOW_MANUAL_PHASE_ADVANCE=true.
+process_vote / process_skill / ai_turn write actions only.
+timeout_handler is a legacy wrapper around advanceGame().
+```
+
 ---
 
 ## 2.2 禁止行为
@@ -153,7 +165,7 @@ next_phase()
 ```text
 禁止：
 - client update game_state
-- cron 直接改 phase
+- cron 直接改 phase outside advanceGame()
 - AI 触发 phase change
 ```
 
@@ -220,7 +232,8 @@ pg_advisory_lock(game_id_hash)
 必须覆盖：
 
 ```text
-- next_phase
+- game_tick
+- next_phase (debug only)
 - process_vote
 - ai_turn
 - start_game
@@ -246,6 +259,15 @@ where ended_at is null;
 
 同一房间同一时间只能存在一个未结束的 game。
 
+`start_game` 必须在读取 `rooms.status` 时使用：
+
+```sql
+select *
+from rooms
+where id = ?
+for update
+```
+
 ---
 
 # 4. 状态版本控制（防重复推进）
@@ -269,6 +291,8 @@ SET phase = ?,
 WHERE game_id = ?
   AND state_version = ?
 ```
+
+如果没有更新任何行，表示已有请求完成推进；必须视为幂等 no-op，不得重复写 phase event。
 
 ---
 
@@ -386,6 +410,8 @@ AI 只能收到：
 - AI 可沉默
 - AI 可主动带节奏
 - AI 不得每次 prompt 都回应
+- AI speak / vote / skill / pass 必须先写入 game_actions
+- AI 重复触发不得产生重复消息或多重行动
 ```
 
 ---
@@ -629,10 +655,8 @@ game_actions.request_id 是唯一 request identity；不得再创建 game_action
 恢复规则：
 
 ```text
-- 读取 game_state
-- 读取 game_members
-- 读取 game_member_profiles
-- 读取 game_member_state
+- 调用 getPlayerView(game_id, user_id)
+- 只返回当前用户可见字段
 - 重新订阅 channel
 ```
 

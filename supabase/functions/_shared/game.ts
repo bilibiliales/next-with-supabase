@@ -3,6 +3,26 @@ import type { SqlExecutor } from "./db.ts";
 
 type Phase = "waiting" | "night" | "day" | "vote" | "settlement" | "ended";
 type Channel = "lobby" | "public" | "wolf" | "dead" | "system";
+type AiDecision = {
+  action: "speak" | "vote" | "skill" | "pass";
+  target?: number | null;
+  content?: string;
+  channel?: Channel;
+  skill?: string;
+};
+
+export type AdvanceGameResult = {
+  game_id: string;
+  room_id: string;
+  previous_phase: Phase;
+  phase: Phase;
+  round_no: number;
+  deadline_at: string | null;
+  state_version: number;
+  advanced: boolean;
+  ended: boolean;
+  winner: string | null;
+};
 
 const AI_PERSONALITIES = ["aggressive", "logical", "chaotic", "deceptive", "silent"] as const;
 const AI_NAMES = ["Ash", "Blake", "Chen", "Devon", "Eli", "Finley", "Gray", "Hayes"];
@@ -25,6 +45,11 @@ const PHASE_ORDER: Record<Phase, Phase> = {
 
 export function deadlineFor(phase: Exclude<Phase, "waiting" | "ended">): string {
   return new Date(Date.now() + PHASE_SECONDS[phase] * 1000).toISOString();
+}
+
+export function isDeadlineReached(deadlineAt: string | null): boolean {
+  if (!deadlineAt) return false;
+  return Date.now() >= new Date(deadlineAt).getTime();
 }
 
 function nicknameFromUser(user: AuthUser): string {
@@ -216,6 +241,46 @@ export async function setReady(sql: SqlExecutor, user: AuthUser, input: Record<s
   return await roomSnapshot(sql, roomId, user.id);
 }
 
+export async function resetRoom(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
+  const roomId = assertUuid(input.room_id, "room_id");
+
+  const roomRows = await sql`
+    select *
+    from public.rooms
+    where id = ${roomId}
+    for update
+  `;
+  const room = roomRows[0];
+  if (!room) throw new HttpError(404, "Room not found.");
+  if (room.owner_id !== user.id) throw new HttpError(403, "Only the room owner can reset the room.");
+  if (room.status !== "POST_GAME") throw new HttpError(409, "Only post-game rooms can be reset.");
+
+  const activeGames = await sql`
+    select 1
+    from public.games
+    where room_id = ${roomId}
+      and ended_at is null
+    limit 1
+  `;
+  if (activeGames[0]) throw new HttpError(409, "Cannot reset while a game is still active.");
+
+  await sql`
+    update public.room_members
+    set is_ready = (user_id = ${room.owner_id})
+    where room_id = ${roomId}
+      and left_at is null
+  `;
+
+  await sql`
+    update public.rooms
+    set status = 'WAITING'
+    where id = ${roomId}
+  `;
+
+  await ensureRoomChannels(sql, roomId, null);
+  return await roomSnapshot(sql, roomId, user.id);
+}
+
 export async function leaveRoom(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
   const roomId = assertUuid(input.room_id, "room_id");
 
@@ -250,7 +315,11 @@ export async function listRooms(sql: SqlExecutor) {
 }
 
 export async function roomSnapshot(sql: SqlExecutor, roomId: string, userId: string) {
-  const roomRows = await sql`select * from public.rooms where id = ${roomId}`;
+  const roomRows = await sql`
+    select *
+    from public.rooms
+    where id = ${roomId}
+  `;
   const room = roomRows[0];
   if (!room) throw new HttpError(404, "Room not found.");
 
@@ -292,7 +361,12 @@ export async function startGame(sql: SqlExecutor, user: AuthUser, input: Record<
   const roomId = assertUuid(input.room_id, "room_id");
   await ensureProfile(sql, user);
 
-  const roomRows = await sql`select * from public.rooms where id = ${roomId}`;
+  const roomRows = await sql`
+    select *
+    from public.rooms
+    where id = ${roomId}
+    for update
+  `;
   const room = roomRows[0];
   if (!room) throw new HttpError(404, "Room not found.");
   if (room.owner_id !== user.id) throw new HttpError(403, "Only the room owner can start the game.");
@@ -381,7 +455,7 @@ export async function startGame(sql: SqlExecutor, user: AuthUser, input: Record<
   return await gameSnapshot(sql, gameId, user.id);
 }
 
-export async function gameSnapshot(sql: SqlExecutor, gameId: string, userId: string) {
+export async function getPlayerView(sql: SqlExecutor, gameId: string, userId: string) {
   const gameRows = await sql`
     select g.*, r.status as room_status
     from public.games g
@@ -470,9 +544,13 @@ export async function gameSnapshot(sql: SqlExecutor, gameId: string, userId: str
   };
 }
 
+export async function gameSnapshot(sql: SqlExecutor, gameId: string, userId: string) {
+  return await getPlayerView(sql, gameId, userId);
+}
+
 function visibleChannels(phase: Phase, role: string, alive: boolean, roomStatus: string): Channel[] {
   const channels: Channel[] = ["system"];
-  if (roomStatus === "WAITING" || roomStatus === "POST_GAME") channels.push("lobby");
+  if (roomStatus === "WAITING") channels.push("lobby");
   if (phase === "day" || phase === "vote" || phase === "settlement" || phase === "ended") channels.push("public");
   if (phase === "night" && role === "wolf" && alive) channels.push("wolf");
   if (!alive) channels.push("dead");
@@ -523,7 +601,7 @@ export async function postMessage(sql: SqlExecutor, user: AuthUser, input: Recor
     member = members[0] ?? null;
   }
 
-  if (channel === "lobby" && room.status !== "WAITING" && room.status !== "POST_GAME") {
+  if (channel === "lobby" && room.status !== "WAITING") {
     throw new HttpError(409, "Lobby chat is closed while the game is active.");
   }
   if (channel === "public" && (!game || !["day", "vote", "settlement", "ended"].includes(game.phase))) {
@@ -631,24 +709,111 @@ export async function processSkill(sql: SqlExecutor, user: AuthUser, input: Reco
   };
 }
 
-export async function nextPhase(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
-  const gameId = assertUuid(input.game_id, "game_id");
-  await actingContext(sql, gameId, user.id);
-
-  const stateRows = await sql`select * from public.game_state where game_id = ${gameId}`;
+export async function advanceGame(sql: SqlExecutor, gameId: string): Promise<AdvanceGameResult> {
+  const stateRows = await sql`
+    select gs.*, g.room_id, g.winner, g.ended_at
+    from public.game_state gs
+    join public.games g on g.id = gs.game_id
+    where gs.game_id = ${gameId}
+    for update of gs, g
+  `;
   const state = stateRows[0];
   if (!state) throw new HttpError(404, "Game state not found.");
-  if (state.phase === "ended") return await gameSnapshot(sql, gameId, user.id);
 
-  if (state.phase === "night") await maybeResolveNight(sql, gameId, state.round_no, true);
-  else if (state.phase === "vote") await maybeResolveVote(sql, gameId, state.round_no, true);
-  else if (state.phase === "day") await setPhase(sql, gameId, "vote", state.round_no);
-  else if (state.phase === "settlement") {
-    const winner = await evaluateWinner(sql, gameId);
-    if (!winner) await setPhase(sql, gameId, "night", state.round_no + 1);
+  const previousPhase = state.phase as Phase;
+  if (state.ended_at || previousPhase === "ended") {
+    return {
+      game_id: gameId,
+      room_id: state.room_id,
+      previous_phase: previousPhase,
+      phase: previousPhase,
+      round_no: state.round_no,
+      deadline_at: state.deadline_at,
+      state_version: state.state_version,
+      advanced: false,
+      ended: previousPhase === "ended",
+      winner: state.winner ?? null,
+    };
   }
-  else await setPhase(sql, gameId, PHASE_ORDER[state.phase as Phase], state.round_no);
 
+  let targetPhase: Phase = PHASE_ORDER[previousPhase];
+  let targetRound = state.round_no as number;
+  let winner: string | null = null;
+
+  if (previousPhase === "night") {
+    await maybeResolveNight(sql, gameId, state.round_no, true);
+    targetPhase = "day";
+  } else if (previousPhase === "day") {
+    targetPhase = "vote";
+  } else if (previousPhase === "vote") {
+    await maybeResolveVote(sql, gameId, state.round_no, true);
+    targetPhase = "settlement";
+  } else if (previousPhase === "settlement") {
+    winner = await evaluateWinner(sql, gameId);
+    targetPhase = winner ? "ended" : "night";
+    targetRound = winner ? state.round_no : state.round_no + 1;
+  } else if (previousPhase === "waiting") {
+    targetPhase = "night";
+  }
+
+  const updated = await setPhase(sql, gameId, targetPhase, targetRound, state.state_version);
+  if (!updated) {
+    return {
+      game_id: gameId,
+      room_id: state.room_id,
+      previous_phase: previousPhase,
+      phase: previousPhase,
+      round_no: state.round_no,
+      deadline_at: state.deadline_at,
+      state_version: state.state_version,
+      advanced: false,
+      ended: false,
+      winner: state.winner ?? null,
+    };
+  }
+
+  return {
+    game_id: gameId,
+    room_id: state.room_id,
+    previous_phase: previousPhase,
+    phase: updated.phase as Phase,
+    round_no: updated.round_no as number,
+    deadline_at: updated.deadline_at as string | null,
+    state_version: updated.state_version as number,
+    advanced: true,
+    ended: updated.phase === "ended",
+    winner,
+  };
+}
+
+export async function runPendingAiTurns(sql: SqlExecutor, gameId: string) {
+  const stateRows = await sql`
+    select *
+    from public.game_state
+    where game_id = ${gameId}
+  `;
+  const state = stateRows[0];
+  if (!state || !["night", "day", "vote"].includes(state.phase)) {
+    return { actions: 0, results: [] as Record<string, unknown>[] };
+  }
+
+  const aiRows = await pendingAiRows(sql, gameId, state);
+  const results: Record<string, unknown>[] = [];
+  for (const ai of aiRows) {
+    results.push(await applyAiTurn(sql, gameId, ai, state));
+  }
+
+  return { actions: results.filter((result) => result.action !== "none").length, results };
+}
+
+export async function nextPhase(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
+  if (Deno.env.get("ALLOW_MANUAL_PHASE_ADVANCE") !== "true") {
+    throw new HttpError(403, "Manual phase advance is disabled.");
+  }
+
+  const gameId = assertUuid(input.game_id, "game_id");
+  await requireRoomOwnerForGame(sql, gameId, user.id);
+  await advanceGame(sql, gameId);
   return await gameSnapshot(sql, gameId, user.id);
 }
 
@@ -659,20 +824,15 @@ export async function timeoutHandler(sql: SqlExecutor, user: AuthUser, input: Re
   const stateRows = await sql`select * from public.game_state where game_id = ${gameId}`;
   const state = stateRows[0];
   if (!state) throw new HttpError(404, "Game state not found.");
-  if (state.phase === "ended") return await gameSnapshot(sql, gameId, user.id);
-  if (!isPastGrace(state.deadline_at)) {
+  if (state.phase === "ended") {
+    return { applied: false, snapshot: await gameSnapshot(sql, gameId, user.id) };
+  }
+  if (!isDeadlineReached(state.deadline_at)) {
     return { applied: false, snapshot: await gameSnapshot(sql, gameId, user.id) };
   }
 
-  if (state.phase === "vote") await maybeResolveVote(sql, gameId, state.round_no, true);
-  else if (state.phase === "night") await maybeResolveNight(sql, gameId, state.round_no, true);
-  else if (state.phase === "day") await setPhase(sql, gameId, "vote", state.round_no);
-  else if (state.phase === "settlement") {
-    const winner = await evaluateWinner(sql, gameId);
-    if (!winner) await setPhase(sql, gameId, "night", state.round_no + 1);
-  }
-
-  return { applied: true, snapshot: await gameSnapshot(sql, gameId, user.id) };
+  const transition = await advanceGame(sql, gameId);
+  return { applied: transition.advanced, transition, snapshot: await gameSnapshot(sql, gameId, user.id) };
 }
 
 export async function aiTurn(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
@@ -682,43 +842,16 @@ export async function aiTurn(sql: SqlExecutor, user: AuthUser, input: Record<str
   const stateRows = await sql`select * from public.game_state where game_id = ${gameId}`;
   const state = stateRows[0];
   if (!state || state.phase === "ended") throw new HttpError(409, "No active AI turn is available.");
+  if (!["night", "day", "vote"].includes(state.phase)) throw new HttpError(409, "No active AI turn is available in this phase.");
   ensureBeforeGrace(state.deadline_at);
 
-  const aiRows = await sql`
-    select gm.*, gmp.role, gmp.ai_personality, gmp.ai_name, gms.alive
-    from public.game_members gm
-    join public.game_member_profiles gmp on gmp.member_id = gm.id
-    join public.game_member_state gms on gms.member_id = gm.id
-    where gm.game_id = ${gameId}
-      and gm.is_ai = true
-      and gms.alive = true
-    order by random()
-    limit 1
-  `;
-  const ai = aiRows[0];
-  if (!ai) throw new HttpError(404, "No living AI members found.");
-
-  const action = await decideAiAction(sql, gameId, ai, state);
-  if (action.action === "speak") {
-    const roomRows = await sql`select room_id from public.games where id = ${gameId}`;
-    const roomId = roomRows[0].room_id;
-    const channelId = await ensureChannel(sql, roomId, gameId, action.channel as Channel);
-    await sql`
-      insert into public.messages (room_id, game_id, channel_id, sender_id, sender_member_id, seat_no, content, metadata)
-      values (${roomId}, ${gameId}, ${channelId}, null, ${ai.id}, ${ai.seat_no}, ${action.content}, ${sql.json({ seat: ai.seat_no })})
-    `;
-  } else if (action.action === "vote") {
-    await upsertMemberAction(sql, gameId, ai.id, "vote", "vote", state.round_no, action.target, { ai: true }, crypto.randomUUID());
-  } else if (action.action === "skill") {
-    await upsertMemberAction(sql, gameId, ai.id, action.skill, "night", state.round_no, action.target, { ai: true }, crypto.randomUUID());
-  } else {
-    await upsertMemberAction(sql, gameId, ai.id, "pass", state.phase, state.round_no, null, { ai: true }, crypto.randomUUID());
-  }
+  const aiRows = await pendingAiRows(sql, gameId, state, true);
+  const result = aiRows[0]
+    ? await applyAiTurn(sql, gameId, aiRows[0], state)
+    : { action: "none", target: null, content: "" };
 
   return {
-    action: action.action,
-    target: action.target ?? null,
-    content: action.content ?? "",
+    ...result,
     snapshot: await gameSnapshot(sql, gameId, user.id),
   };
 }
@@ -726,7 +859,7 @@ export async function aiTurn(sql: SqlExecutor, user: AuthUser, input: Record<str
 export async function reconnect(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
   await ensureProfile(sql, user);
   const gameId = typeof input.game_id === "string" ? input.game_id : null;
-  if (gameId) return await gameSnapshot(sql, assertUuid(gameId, "game_id"), user.id);
+  if (gameId) return await getPlayerView(sql, assertUuid(gameId, "game_id"), user.id);
 
   const roomId = typeof input.room_id === "string" ? input.room_id : null;
   if (roomId) {
@@ -738,7 +871,7 @@ export async function reconnect(sql: SqlExecutor, user: AuthUser, input: Record<
       order by g.started_at desc nulls last
       limit 1
     `;
-    if (activeGame[0]) return await gameSnapshot(sql, activeGame[0].id, user.id);
+    if (activeGame[0]) return await getPlayerView(sql, activeGame[0].id, user.id);
     return await roomSnapshot(sql, roomId, user.id);
   }
 
@@ -777,6 +910,102 @@ async function actingContext(sql: SqlExecutor, gameId: string, userId: string) {
   };
 }
 
+async function requireRoomOwnerForGame(sql: SqlExecutor, gameId: string, userId: string) {
+  const rows = await sql`
+    select r.owner_id
+    from public.games g
+    join public.rooms r on r.id = g.room_id
+    where g.id = ${gameId}
+  `;
+  if (!rows[0]) throw new HttpError(404, "Game not found.");
+  if (rows[0].owner_id !== userId) throw new HttpError(403, "Only the room owner can manually advance phase.");
+}
+
+async function pendingAiRows(sql: SqlExecutor, gameId: string, state: Record<string, unknown>, single = false) {
+  if (single) {
+    return await sql`
+      select gm.*, gmp.role, gmp.ai_personality, gmp.ai_name, gms.alive
+      from public.game_members gm
+      join public.game_member_profiles gmp on gmp.member_id = gm.id
+      join public.game_member_state gms on gms.member_id = gm.id
+      where gm.game_id = ${gameId}
+        and gm.is_ai = true
+        and gms.alive = true
+        and not exists (
+          select 1
+          from public.game_actions ga
+          where ga.game_id = ${gameId}
+            and ga.actor_member_id = gm.id
+            and ga.phase = ${state.phase}
+            and ga.round_no = ${state.round_no}
+            and ga.resolved_at is null
+        )
+      order by random()
+      limit 1
+    `;
+  }
+
+  return await sql`
+    select gm.*, gmp.role, gmp.ai_personality, gmp.ai_name, gms.alive
+    from public.game_members gm
+    join public.game_member_profiles gmp on gmp.member_id = gm.id
+    join public.game_member_state gms on gms.member_id = gm.id
+    where gm.game_id = ${gameId}
+      and gm.is_ai = true
+      and gms.alive = true
+      and not exists (
+        select 1
+        from public.game_actions ga
+        where ga.game_id = ${gameId}
+          and ga.actor_member_id = gm.id
+          and ga.phase = ${state.phase}
+          and ga.round_no = ${state.round_no}
+          and ga.resolved_at is null
+      )
+    order by random()
+  `;
+}
+
+async function applyAiTurn(
+  sql: SqlExecutor,
+  gameId: string,
+  ai: Record<string, unknown>,
+  state: Record<string, unknown>,
+) {
+  const action = await decideAiAction(sql, gameId, ai, state);
+
+  if (action.action === "speak") {
+    const roomRows = await sql`select room_id from public.games where id = ${gameId}`;
+    const roomId = roomRows[0].room_id;
+    const channelId = await ensureChannel(sql, roomId, gameId, action.channel as Channel);
+    const actionResult = await upsertMemberAction(sql, gameId, ai.id as string, "speak", "day", state.round_no as number, action.target ?? null, {
+      ai: true,
+      channel: action.channel,
+      content: action.content,
+    }, crypto.randomUUID());
+    if (actionResult.status === "created") {
+      await sql`
+        insert into public.messages (room_id, game_id, channel_id, sender_id, sender_member_id, seat_no, content, metadata)
+        values (${roomId}, ${gameId}, ${channelId}, null, ${ai.id}, ${ai.seat_no}, ${action.content}, ${sql.json({ seat: ai.seat_no })})
+      `;
+    }
+  } else if (action.action === "vote") {
+    await upsertMemberAction(sql, gameId, ai.id as string, "vote", "vote", state.round_no as number, action.target ?? null, { ai: true }, crypto.randomUUID());
+  } else if (action.action === "skill") {
+    await upsertMemberAction(sql, gameId, ai.id as string, action.skill ?? "pass", "night", state.round_no as number, action.target ?? null, { ai: true }, crypto.randomUUID());
+  } else {
+    await upsertMemberAction(sql, gameId, ai.id as string, "pass", state.phase as string, state.round_no as number, null, { ai: true }, crypto.randomUUID());
+  }
+
+  return {
+    action: action.action,
+    target: action.target ?? null,
+    content: action.content ?? "",
+    actor_member_id: ai.id,
+    seat_no: ai.seat_no,
+  };
+}
+
 function ensureBeforeGrace(deadlineAt: string | null) {
   if (isPastGrace(deadlineAt)) {
     throw new HttpError(409, "The action window is closed.");
@@ -811,7 +1040,7 @@ async function upsertMemberAction(
     from public.game_actions
     where request_id = ${requestId}
   `;
-  if (sameRequest[0]) return;
+  if (sameRequest[0]) return { status: "duplicate" as const, action_id: sameRequest[0].id };
 
   const existing = await sql`
     select id
@@ -835,16 +1064,20 @@ async function upsertMemberAction(
           locked_at = now()
       where id = ${existing[0].id}
     `;
-    return;
+    return { status: "updated" as const, action_id: existing[0].id };
   }
 
-  await sql`
+  const inserted = await sql`
     insert into public.game_actions (request_id, game_id, actor_member_id, action_type, phase, round_no, target_seat_no, payload, locked_at)
     values (${requestId}, ${gameId}, ${actorMemberId}, ${actionType}, ${phase}, ${roundNo}, ${targetSeatNo}, ${sql.json(payload)}, now())
+    returning id
   `;
+  return { status: "created" as const, action_id: inserted[0].id };
 }
 
 async function maybeResolveVote(sql: SqlExecutor, gameId: string, roundNo: number, force: boolean) {
+  if (await hasResolutionEvent(sql, gameId, "vote_resolved", roundNo)) return true;
+
   const aliveRows = await sql`
     select gm.id
     from public.game_members gm
@@ -887,6 +1120,7 @@ async function maybeResolveVote(sql: SqlExecutor, gameId: string, roundNo: numbe
       where gms.member_id = gm.id
         and gm.game_id = ${gameId}
         and gm.seat_no = ${eliminatedSeat}
+        and gms.alive = true
     `;
   }
 
@@ -899,12 +1133,13 @@ async function maybeResolveVote(sql: SqlExecutor, gameId: string, roundNo: numbe
       and resolved_at is null
   `;
 
-  await recordEvent(sql, gameId, null, "vote_resolved", { eliminated_seat: eliminatedSeat, votes: Object.fromEntries(counts) });
-  await setPhase(sql, gameId, "settlement", roundNo);
+  await recordEvent(sql, gameId, null, "vote_resolved", { round_no: roundNo, eliminated_seat: eliminatedSeat, votes: Object.fromEntries(counts) });
   return true;
 }
 
 async function maybeResolveNight(sql: SqlExecutor, gameId: string, roundNo: number, force: boolean) {
+  if (await hasResolutionEvent(sql, gameId, "night_resolved", roundNo)) return true;
+
   const eligibleRows = await sql`
     select gm.id, gmp.role
     from public.game_members gm
@@ -961,6 +1196,7 @@ async function maybeResolveNight(sql: SqlExecutor, gameId: string, roundNo: numb
       where gms.member_id = gm.id
         and gm.game_id = ${gameId}
         and gm.seat_no = ${seatNo}
+        and gms.alive = true
     `;
   }
 
@@ -974,12 +1210,24 @@ async function maybeResolveNight(sql: SqlExecutor, gameId: string, roundNo: numb
   `;
 
   await recordEvent(sql, gameId, null, "night_resolved", {
+    round_no: roundNo,
     killed_seats: [...deathMetadata.keys()],
     death_reasons: Object.fromEntries([...deathMetadata].map(([seat, death]) => [seat, death.reason])),
     death_details: Object.fromEntries(deathMetadata),
   });
-  await setPhase(sql, gameId, "day", roundNo);
   return true;
+}
+
+async function hasResolutionEvent(sql: SqlExecutor, gameId: string, eventType: string, roundNo: number): Promise<boolean> {
+  const rows = await sql`
+    select 1
+    from public.game_events
+    where game_id = ${gameId}
+      and event_type = ${eventType}
+      and payload ->> 'round_no' = ${String(roundNo)}
+    limit 1
+  `;
+  return Boolean(rows[0]);
 }
 
 function mostCommon(values: number[]): number | null {
@@ -991,16 +1239,8 @@ function mostCommon(values: number[]): number | null {
   return ranked[0][0];
 }
 
-async function setPhase(sql: SqlExecutor, gameId: string, phase: Phase, roundNo: number) {
+async function setPhase(sql: SqlExecutor, gameId: string, phase: Phase, roundNo: number, expectedVersion: number) {
   const deadline = phase === "ended" || phase === "waiting" ? null : deadlineFor(phase);
-  const stateRows = await sql`
-    select state_version
-    from public.game_state
-    where game_id = ${gameId}
-    for update
-  `;
-  if (!stateRows[0]) throw new HttpError(404, "Game state not found.");
-
   const updated = await sql`
     update public.game_state
     set phase = ${phase},
@@ -1009,12 +1249,13 @@ async function setPhase(sql: SqlExecutor, gameId: string, phase: Phase, roundNo:
         state_version = state_version + 1,
         updated_at = now()
     where game_id = ${gameId}
-      and state_version = ${stateRows[0].state_version}
-    returning state_version
+      and state_version = ${expectedVersion}
+    returning phase, round_no, deadline_at, state_version
   `;
-  if (!updated[0]) throw new HttpError(409, "Game state version changed during transition.");
+  if (!updated[0]) return false;
 
   await recordEvent(sql, gameId, null, "phase_changed", { phase, round_no: roundNo, deadline_at: deadline });
+  return true;
 }
 
 async function evaluateWinner(sql: SqlExecutor, gameId: string): Promise<string | null> {
@@ -1048,8 +1289,6 @@ async function evaluateWinner(sql: SqlExecutor, gameId: string): Promise<string 
     set status = 'POST_GAME'
     where id = ${game.room_id}
   `;
-  const stateRows = await sql`select round_no from public.game_state where game_id = ${gameId}`;
-  await setPhase(sql, gameId, "ended", stateRows[0]?.round_no ?? 1);
   await sql`
     insert into public.game_results (game_id, member_id, seat_no, is_ai, role, winner, snapshot, duration_seconds)
     select ${gameId}, gm.id, gm.seat_no, gm.is_ai, gmp.role, ${winner},
@@ -1075,7 +1314,7 @@ async function evaluateWinner(sql: SqlExecutor, gameId: string): Promise<string 
   return winner;
 }
 
-async function decideAiAction(sql: SqlExecutor, gameId: string, ai: Record<string, unknown>, state: Record<string, unknown>) {
+async function decideAiAction(sql: SqlExecutor, gameId: string, ai: Record<string, unknown>, state: Record<string, unknown>): Promise<AiDecision> {
   const phase = state.phase as Phase;
   const role = ai.role as string;
   const seatNo = ai.seat_no as number;

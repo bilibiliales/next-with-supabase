@@ -41,6 +41,14 @@ Partial initialization is forbidden.
 game_state.phase 是唯一真相
 ```
 
+```text
+Only shared advanceGame() may mutate game_state.phase.
+game_tick invokes advanceGame() from Supabase Cron every 30 seconds.
+next_phase is debug-only and requires ALLOW_MANUAL_PHASE_ADVANCE=true.
+timeout_handler is a legacy wrapper around advanceGame().
+process_vote / process_skill / ai_turn must not advance phase.
+```
+
 禁止：
 
 * 前端推断状态
@@ -141,6 +149,14 @@ create table games (
 create unique index one_active_game_per_room
 on games(room_id)
 where ended_at is null;
+```
+
+```sql
+-- start_game must lock the room row before checking status
+select *
+from rooms
+where id = ?
+for update;
 ```
 
 ---
@@ -338,11 +354,13 @@ ALL writes to game logic must go through Edge Functions
 
 ```text
 start_game
-next_phase
+game_tick
+next_phase (debug only)
 process_vote
 ai_turn
-timeout_handler
+timeout_handler (legacy wrapper)
 reconnect
+room_action.reset_room
 ```
 
 ---
@@ -365,10 +383,11 @@ pg_advisory_xact_lock(hashtext(game_id::text))
 必须用于：
 
 * start_game
-* next_phase
+* game_tick
+* next_phase (debug only)
 * vote resolution
 * AI actions
-* timeout handler
+* timeout handler (legacy wrapper)
 
 ---
 
@@ -418,7 +437,7 @@ topic = room:{room_id}:{channel}
 
 ## channel规则：
 
-* lobby → waiting/post_game
+* lobby → waiting
 * public → day
 * wolf → night
 * dead → dead
@@ -436,6 +455,7 @@ AI only receives:
 - compressed state
 - visible messages
 - event summary
+AI actions must be persisted through game_actions before messages/votes/skills are produced.
 ```
 
 ---

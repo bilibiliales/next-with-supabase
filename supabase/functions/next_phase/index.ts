@@ -17,6 +17,16 @@ serve((req) =>
       winner: result.game.winner,
     });
 
+    if (result.state.phase === "ended") {
+      await broadcastToRoom(result.game.room_id, "system", "state", {
+        type: "game_ended",
+        game_id: result.game.id,
+        phase: result.state.phase,
+        round_no: result.state.round_no,
+        winner: result.game.winner,
+      });
+    }
+
     return result;
   })
 );
