@@ -154,6 +154,10 @@ create unique index if not exists uq_action_phase_lock
 on public.game_actions(game_id, actor_member_id, action_type, phase, round_no)
 where resolved_at is null;
 
+create unique index if not exists uq_ai_action_once_per_phase
+on public.game_actions(game_id, actor_member_id, phase, round_no)
+where resolved_at is null and payload @> '{"ai": true}'::jsonb;
+
 create table if not exists public.game_events (
     id bigserial primary key,
     game_id uuid references public.games(id) on delete cascade,

@@ -1,7 +1,7 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { broadcastToRoom, corsHeaders, json } from "../_shared/http.ts";
 import { getSql, tryWithGameLock } from "../_shared/db.ts";
-import { advanceGame } from "../_shared/game.ts";
+import { advanceGame, type AdvanceGameResult } from "../_shared/game.ts";
 
 function serviceAuthorized(req: Request): boolean {
   const authHeader = req.headers.get("authorization") ?? "";
@@ -24,6 +24,10 @@ function sanitizeTickResult(result: Record<string, unknown>): Record<string, unk
   return publicResult;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (!serviceAuthorized(req)) return json({ ok: false, error: "Unauthorized game tick request." }, 401);
@@ -35,21 +39,35 @@ serve(async (req) => {
     join public.game_state gs on gs.game_id = g.id
     where g.ended_at is null
       and gs.phase <> 'ended'
+      and gs.state_version is not null
       and (
-        gs.phase = 'waiting'
-        or gs.deadline_at <= now()
+        (
+          gs.phase = 'waiting'
+          and g.started_at is not null
+          and g.started_at <= now() - interval '3 seconds'
+        )
+        or (
+          gs.phase <> 'waiting'
+          and gs.deadline_at <= now()
+        )
       )
-    order by gs.deadline_at asc nulls last
-    limit 100
+    order by coalesce(gs.deadline_at, g.started_at) asc nulls last
+    limit 20
   `;
 
   const results: Record<string, unknown>[] = [];
 
   for (const game of activeGames) {
     try {
-      const result = await tryWithGameLock(game.id as string, async (tx) => {
-        return await advanceGame(tx, game.id as string);
-      });
+      let result: AdvanceGameResult | null = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        result = await tryWithGameLock(game.id as string, async (tx) => {
+          return await advanceGame(tx, game.id as string);
+        });
+        if (result) break;
+        await sleep(50);
+      }
+
       if (!result) {
         results.push({
           game_id: game.id,

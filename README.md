@@ -219,8 +219,9 @@ Rules:
 
 * Supabase Cron invokes `game_tick` every 30 seconds
 * Clients never advance game state
-* `game_tick` only scans due games: `ended_at is null` and (`deadline_at <= now()` or `phase = 'waiting'`)
-* `game_tick` uses non-blocking PostgreSQL advisory locks and skips already-locked games
+* `game_tick` scans due games: `ended_at is null` and either `deadline_at <= now()` for active phases or initialized `waiting` games older than 3 seconds
+* `game_tick` uses non-blocking PostgreSQL advisory locks, retries briefly, and skips still-locked games
+* `game_tick` processes at most 20 games per invocation
 * `game_tick` calls `advanceGame(game_id)` for each active game
 * `advanceGame()` drains pending AI actions, checks `deadline_at`, resolves actions, and advances phase
 * Do not introduce polling loops or background workers inside Edge Functions
@@ -268,6 +269,7 @@ Open actions are unique by `(game_id, actor_member_id, action_type, phase, round
 `game_actions.request_id` is the only idempotency key; there is no separate request ledger table.
 AI turns must also write through `game_actions` before producing messages, votes, or skills.
 AI request IDs must be deterministic per `game_id + member_id + action_type + phase + round_no`, and AI intents are logged as `ai_action_submitted` events.
+AI actions also have a partial unique index on `(game_id, actor_member_id, phase, round_no)` where `payload @> '{"ai": true}'::jsonb` and `resolved_at is null`.
 
 ---
 
