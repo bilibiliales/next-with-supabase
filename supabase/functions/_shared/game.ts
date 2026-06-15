@@ -197,8 +197,8 @@ export async function createRoom(sql: SqlExecutor, user: AuthUser, input: Record
   await ensureRoomChannels(sql, room.id, null);
 
   await sql`
-    insert into public.room_members (room_id, user_id, is_ready)
-    values (${room.id}, ${user.id}, true)
+    insert into public.room_members (room_id, user_id, is_ready, post_game_ready)
+    values (${room.id}, ${user.id}, true, false)
   `;
 
   return await roomSnapshot(sql, room.id, user.id);
@@ -231,10 +231,13 @@ export async function joinRoom(sql: SqlExecutor, user: AuthUser, input: Record<s
   if (activeMembers[0].count >= room.max_players) throw new HttpError(409, "Room is full.");
 
   await sql`
-    insert into public.room_members (room_id, user_id, is_ready, left_at)
-    values (${room.id}, ${user.id}, false, null)
+    insert into public.room_members (room_id, user_id, is_ready, post_game_ready, left_at)
+    values (${room.id}, ${user.id}, false, false, null)
     on conflict (room_id, user_id)
-    do update set left_at = null, joined_at = now()
+    do update set is_ready = false,
+                  post_game_ready = false,
+                  left_at = null,
+                  joined_at = now()
   `;
 
   return await roomSnapshot(sql, room.id, user.id);
@@ -257,8 +260,35 @@ export async function setReady(sql: SqlExecutor, user: AuthUser, input: Record<s
   return await roomSnapshot(sql, roomId, user.id);
 }
 
+export async function setPostGameReady(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
+  const roomId = assertUuid(input.room_id, "room_id");
+  const ready = input.post_game_ready === false ? false : true;
+
+  const roomRows = await sql`
+    select status
+    from public.rooms
+    where id = ${roomId}
+  `;
+  const room = roomRows[0];
+  if (!room) throw new HttpError(404, "Room not found.");
+  if (room.status !== "POST_GAME") throw new HttpError(409, "Post-game readiness is only available after a game ends.");
+
+  const updated = await sql`
+    update public.room_members
+    set post_game_ready = ${ready}
+    where room_id = ${roomId}
+      and user_id = ${user.id}
+      and left_at is null
+    returning room_id
+  `;
+
+  if (!updated[0]) throw new HttpError(404, "Active room membership not found.");
+  return await latestPostGameSnapshot(sql, roomId, user.id);
+}
+
 export async function resetRoom(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
   const roomId = assertUuid(input.room_id, "room_id");
+  const force = input.force === true;
 
   const roomRows = await sql`
     select *
@@ -271,6 +301,11 @@ export async function resetRoom(sql: SqlExecutor, user: AuthUser, input: Record<
   if (room.owner_id !== user.id) throw new HttpError(403, "Only the room owner can reset the room.");
   if (room.status !== "POST_GAME") throw new HttpError(409, "Only post-game rooms can be reset.");
 
+  const ready = await postGameReadySummary(sql, roomId, user.id);
+  if (!force && !ready.all_ready) {
+    throw new HttpError(409, "Not all active room members have finished reviewing.");
+  }
+
   const activeGames = await sql`
     select 1
     from public.games
@@ -282,7 +317,8 @@ export async function resetRoom(sql: SqlExecutor, user: AuthUser, input: Record<
 
   await sql`
     update public.room_members
-    set is_ready = (user_id = ${room.owner_id})
+    set is_ready = (user_id = ${room.owner_id}),
+        post_game_ready = false
     where room_id = ${roomId}
       and left_at is null
   `;
@@ -300,19 +336,55 @@ export async function resetRoom(sql: SqlExecutor, user: AuthUser, input: Record<
 export async function leaveRoom(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
   const roomId = assertUuid(input.room_id, "room_id");
 
-  const rooms = await sql`select status from public.rooms where id = ${roomId}`;
-  if (!rooms[0]) throw new HttpError(404, "Room not found.");
-  if (rooms[0].status === "LOCKED") throw new HttpError(409, "Cannot leave while the room is locked.");
+  const rooms = await sql`
+    select *
+    from public.rooms
+    where id = ${roomId}
+    for update
+  `;
+  const room = rooms[0];
+  if (!room) throw new HttpError(404, "Room not found.");
+  if (room.status === "LOCKED") throw new HttpError(409, "Cannot leave while the room is locked.");
+
+  const membership = await sql`
+    select 1
+    from public.room_members
+    where room_id = ${roomId}
+      and user_id = ${user.id}
+      and left_at is null
+  `;
+  if (!membership[0]) throw new HttpError(404, "Active room membership not found.");
+
+  if (room.owner_id === user.id) {
+    await sql`
+      update public.room_members
+      set is_ready = false,
+          post_game_ready = false,
+          left_at = coalesce(left_at, now())
+      where room_id = ${roomId}
+        and left_at is null
+    `;
+
+    await sql`
+      update public.rooms
+      set status = 'CLOSED'
+      where id = ${roomId}
+    `;
+
+    return { room_id: roomId, left: true, dissolved: true };
+  }
 
   await sql`
     update public.room_members
-    set left_at = now()
+    set is_ready = false,
+        post_game_ready = false,
+        left_at = now()
     where room_id = ${roomId}
       and user_id = ${user.id}
       and left_at is null
   `;
 
-  return { room_id: roomId, left: true };
+  return { room_id: roomId, left: true, dissolved: false };
 }
 
 export async function listRooms(sql: SqlExecutor) {
@@ -349,7 +421,7 @@ export async function roomSnapshot(sql: SqlExecutor, roomId: string, userId: str
   if (!membership[0] && room.owner_id !== userId) throw new HttpError(403, "You are not in this room.");
 
   const members = await sql`
-    select rm.user_id, rm.is_ready, rm.joined_at, p.nickname
+    select rm.user_id, rm.is_ready, rm.post_game_ready, rm.joined_at, p.nickname
     from public.room_members rm
     join public.profiles p on p.id = rm.user_id
     where rm.room_id = ${roomId}
@@ -370,7 +442,43 @@ export async function roomSnapshot(sql: SqlExecutor, roomId: string, userId: str
     room,
     members,
     latest_game: games[0] ?? null,
+    post_game_ready: await postGameReadySummary(sql, roomId, userId),
   };
+}
+
+async function postGameReadySummary(sql: SqlExecutor, roomId: string, userId: string) {
+  const rows = await sql`
+    select
+      count(*)::int as active_count,
+      count(*) filter (where post_game_ready = true)::int as ready_count,
+      coalesce(bool_or(user_id = ${userId}::uuid and post_game_ready = true), false) as self_ready
+    from public.room_members
+    where room_id = ${roomId}
+      and left_at is null
+  `;
+  const row = rows[0] ?? {};
+  const activeCount = Number(row.active_count ?? 0);
+  const readyCount = Number(row.ready_count ?? 0);
+
+  return {
+    active_count: activeCount,
+    ready_count: readyCount,
+    self_ready: Boolean(row.self_ready),
+    all_ready: activeCount > 0 && readyCount >= activeCount,
+  };
+}
+
+async function latestPostGameSnapshot(sql: SqlExecutor, roomId: string, userId: string) {
+  const games = await sql`
+    select id
+    from public.games
+    where room_id = ${roomId}
+    order by started_at desc nulls last
+    limit 1
+  `;
+
+  if (games[0]) return await getPlayerView(sql, games[0].id, userId);
+  return await roomSnapshot(sql, roomId, userId);
 }
 
 export async function startGame(sql: SqlExecutor, user: AuthUser, input: Record<string, unknown>) {
@@ -443,6 +551,13 @@ export async function startGame(sql: SqlExecutor, user: AuthUser, input: Record<
   `;
 
   await sql`
+    update public.room_members
+    set post_game_ready = false
+    where room_id = ${roomId}
+      and left_at is null
+  `;
+
+  await sql`
     insert into public.game_state (game_id, phase, round_no, deadline_at, updated_at)
     values (${gameId}, 'night', 1, ${deadlineFor("night")}, now())
   `;
@@ -476,7 +591,7 @@ export async function startGame(sql: SqlExecutor, user: AuthUser, input: Record<
 
 export async function getPlayerView(sql: SqlExecutor, gameId: string, userId: string) {
   const gameRows = await sql`
-    select g.*, r.status as room_status
+    select g.*, r.status as room_status, r.owner_id as room_owner_id
     from public.games g
     join public.rooms r on r.id = g.room_id
     where g.id = ${gameId}
@@ -544,6 +659,11 @@ export async function getPlayerView(sql: SqlExecutor, gameId: string, userId: st
       ended_at: game.ended_at,
       winner: game.winner,
     },
+    room: {
+      id: game.room_id,
+      owner_id: game.room_owner_id,
+      status: game.room_status,
+    },
     state: {
       phase: state.phase,
       round_no: state.round_no,
@@ -560,6 +680,7 @@ export async function getPlayerView(sql: SqlExecutor, gameId: string, userId: st
     channels,
     messages: messages.reverse().map(sanitizeMessage),
     post_game: reveal,
+    post_game_ready: postGame ? await postGameReadySummary(sql, game.room_id, userId) : null,
   };
 }
 
@@ -1003,6 +1124,14 @@ export async function reconnect(sql: SqlExecutor, user: AuthUser, input: Record<
   if (!roomId) return { room: null, latest_game: null };
 
   const safeRoomId = assertUuid(roomId, "room_id");
+  const roomRows = await sql`
+    select status
+    from public.rooms
+    where id = ${safeRoomId}
+  `;
+  const room = roomRows[0];
+  if (!room) throw new HttpError(404, "Room not found.");
+
   const activeGame = await sql`
     select g.id
     from public.games g
@@ -1012,6 +1141,17 @@ export async function reconnect(sql: SqlExecutor, user: AuthUser, input: Record<
     limit 1
   `;
   if (activeGame[0]) return await getPlayerView(sql, activeGame[0].id, user.id);
+  if (room.status === "POST_GAME") {
+    const latestGame = await sql`
+      select id
+      from public.games
+      where room_id = ${safeRoomId}
+      order by started_at desc nulls last
+      limit 1
+    `;
+    if (latestGame[0]) return await getPlayerView(sql, latestGame[0].id, user.id);
+  }
+
   return await roomSnapshot(sql, safeRoomId, user.id);
 }
 

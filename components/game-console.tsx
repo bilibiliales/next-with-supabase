@@ -17,6 +17,12 @@ type PublicRoom = NonNullable<RoomSnapshot["room"]> & {
   human_count: number;
 };
 
+type LeaveRoomResult = {
+  room_id: string;
+  left: boolean;
+  dissolved: boolean;
+};
+
 const CHANNEL_LABELS: Record<ChannelName, string> = {
   lobby: "Lobby",
   public: "Public",
@@ -97,11 +103,16 @@ export function GameConsole() {
   const activeRoomId = game?.game.room_id ?? roomSnapshot?.room?.id ?? null;
   const activeGameId = game?.game.id ?? null;
   const availableChannels = useMemo(
-    () => game?.channels ?? (roomSnapshot?.room ? (["lobby"] as ChannelName[]) : []),
+    () => game?.channels ?? (roomSnapshot?.room ? (["lobby", "system"] as ChannelName[]) : []),
     [game?.channels, roomSnapshot?.room],
   );
   const writableChannels: ChannelName[] = availableChannels.filter((channel) => channel !== "system");
   const channelsKey = availableChannels.join("|");
+  const postGameReady = game?.post_game_ready ?? roomSnapshot?.post_game_ready ?? null;
+  const isRoomOwner = Boolean(
+    session?.user.id &&
+      (game?.room.owner_id === session.user.id || roomSnapshot?.room?.owner_id === session.user.id),
+  );
 
   const run = useCallback(
     async <T,>(label: string, work: () => Promise<T>) => {
@@ -167,7 +178,13 @@ export function GameConsole() {
         .on("broadcast", { event: "state" }, () => {
           run("reconnect", reconnectSnapshot);
         })
-        .on("broadcast", { event: "room" }, () => {
+        .on("broadcast", { event: "room" }, ({ payload }) => {
+          const event = payload as { dissolved?: boolean; type?: string };
+          if (event.dissolved) {
+            setSnapshot(null);
+            setNotice("Room closed.");
+            return;
+          }
           run("reconnect", reconnectSnapshot);
         })
         .subscribe(),
@@ -271,6 +288,44 @@ export function GameConsole() {
       invokeFunction<GameSnapshot>(supabase, "start_game", { room_id: activeRoomId }),
     );
     if (next) setSnapshot(next);
+  }
+
+  async function setPostGameReady(ready = true) {
+    if (!supabase || !activeRoomId) return;
+    const next = await run("post-game-ready", () =>
+      invokeFunction<Snapshot>(supabase, "room_action", {
+        action: "set_post_game_ready",
+        room_id: activeRoomId,
+        post_game_ready: ready,
+      }),
+    );
+    if (next) setSnapshot(next);
+  }
+
+  async function resetRoom(force: boolean) {
+    if (!supabase || !activeRoomId) return;
+    const next = await run("reset-room", () =>
+      invokeFunction<RoomSnapshot>(supabase, "room_action", {
+        action: "reset_room",
+        room_id: activeRoomId,
+        force,
+      }),
+    );
+    if (next) setSnapshot(next);
+  }
+
+  async function leaveRoom() {
+    if (!supabase || !activeRoomId) return;
+    const result = await run("leave-room", () =>
+      invokeFunction<LeaveRoomResult>(supabase, "room_action", {
+        action: "leave_room",
+        room_id: activeRoomId,
+      }),
+    );
+    if (result?.left) {
+      setSnapshot(null);
+      setNotice(result.dissolved ? "Room closed." : "Left room.");
+    }
   }
 
   async function serverAction(functionName: string, body: Record<string, unknown>) {
@@ -443,18 +498,53 @@ export function GameConsole() {
                   <strong>{roomSnapshot.room.invite_code}</strong>
                   <span>Status</span>
                   <strong>{roomSnapshot.room.status}</strong>
+                  {roomSnapshot.room.status === "POST_GAME" && postGameReady ? (
+                    <>
+                      <span>Reviewed</span>
+                      <strong>{postGameReady.ready_count}/{postGameReady.active_count}</strong>
+                    </>
+                  ) : null}
                 </div>
                 <div className="member-list">
                   {roomSnapshot.members?.map((member) => (
                     <div key={member.user_id} className="member-row">
                       <span>{member.nickname}</span>
-                      <small>{member.is_ready ? "Ready" : "Waiting"}</small>
+                      <small>
+                        {roomSnapshot.room?.status === "POST_GAME"
+                          ? member.post_game_ready ? "Reviewed" : "Reviewing"
+                          : member.is_ready ? "Ready" : "Waiting"}
+                      </small>
                     </div>
                   ))}
                 </div>
                 <div className="button-row">
-                  <button className="secondary" onClick={() => setReady(true)}>Ready</button>
-                  <button disabled={roomSnapshot.room.status !== "WAITING"} onClick={startGame}>Start</button>
+                  {roomSnapshot.room.status === "POST_GAME" ? (
+                    <>
+                      <button
+                        className="secondary"
+                        disabled={postGameReady?.self_ready}
+                        onClick={() => setPostGameReady(true)}
+                      >
+                        I finished reviewing
+                      </button>
+                      {isRoomOwner ? (
+                        <button onClick={() => resetRoom(!postGameReady?.all_ready)}>
+                          {postGameReady?.all_ready ? "Open next room" : "Force restart"}
+                        </button>
+                      ) : null}
+                      <button className="secondary" onClick={leaveRoom}>
+                        {isRoomOwner ? "Close room" : "Leave room"}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button className="secondary" onClick={() => setReady(true)}>Ready</button>
+                      <button disabled={roomSnapshot.room.status !== "WAITING"} onClick={startGame}>Start</button>
+                      <button className="secondary" onClick={leaveRoom}>
+                        {isRoomOwner ? "Close room" : "Leave room"}
+                      </button>
+                    </>
+                  )}
                 </div>
               </section>
             ) : null}
@@ -594,15 +684,40 @@ export function GameConsole() {
 
             {game?.post_game ? (
               <section className="postgame-panel">
-                <p className="eyebrow">Post game</p>
+                <div className="section-head">
+                  <p className="eyebrow">Post game</p>
+                  {postGameReady ? (
+                    <span className="ready-count">
+                      {postGameReady.ready_count}/{postGameReady.active_count} reviewed
+                    </span>
+                  ) : null}
+                </div>
                 <div className="reveal-grid">
                   {game.post_game.map((member) => (
                     <div key={member.seat_no} className="reveal-row">
                       <span>Seat {member.seat_no}</span>
                       <strong>{ROLE_LABELS[member.role] ?? member.role}</strong>
                       <small>{member.is_ai ? "AI" : member.nickname ?? "Human"}</small>
+                      {member.death_round ? <small>Out R{member.death_round}</small> : null}
                     </div>
                   ))}
+                </div>
+                <div className="button-row">
+                  <button
+                    className="secondary"
+                    disabled={Boolean(postGameReady?.self_ready)}
+                    onClick={() => setPostGameReady(true)}
+                  >
+                    I finished reviewing
+                  </button>
+                  {isRoomOwner ? (
+                    <button onClick={() => resetRoom(!postGameReady?.all_ready)}>
+                      {postGameReady?.all_ready ? "Open next room" : "Force restart"}
+                    </button>
+                  ) : null}
+                  <button className="secondary" onClick={leaveRoom}>
+                    {isRoomOwner ? "Close room" : "Leave room"}
+                  </button>
                 </div>
               </section>
             ) : null}

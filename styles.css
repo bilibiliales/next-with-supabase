@@ -413,6 +413,12 @@ p {
   font-size: 12px;
 }
 
+.ready-count {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
 .message-list {
   min-height: 190px;
   max-height: 320px;

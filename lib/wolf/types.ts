@@ -2,6 +2,13 @@ export type RoomStatus = "WAITING" | "LOCKED" | "POST_GAME" | "CLOSED";
 export type GamePhase = "waiting" | "night" | "day" | "vote" | "settlement" | "ended";
 export type ChannelName = "lobby" | "public" | "wolf" | "dead" | "system";
 
+export type PostGameReady = {
+  active_count: number;
+  ready_count: number;
+  self_ready: boolean;
+  all_ready: boolean;
+};
+
 export type RoomSnapshot = {
   room: {
     id: string;
@@ -19,6 +26,7 @@ export type RoomSnapshot = {
     user_id: string;
     nickname: string;
     is_ready: boolean;
+    post_game_ready: boolean;
     joined_at: string;
   }>;
   latest_game?: {
@@ -27,7 +35,10 @@ export type RoomSnapshot = {
     round_no?: number;
     deadline_at?: string | null;
     winner?: string | null;
+    started_at?: string | null;
+    ended_at?: string | null;
   } | null;
+  post_game_ready?: PostGameReady | null;
 };
 
 export type GameMessage = {
@@ -46,6 +57,11 @@ export type GameSnapshot = {
     winner: "wolves" | "villagers" | "draw" | null;
     started_at: string;
     ended_at: string | null;
+  };
+  room: {
+    id: string;
+    owner_id: string;
+    status: RoomStatus;
   };
   state: {
     phase: GamePhase;
@@ -72,7 +88,11 @@ export type GameSnapshot = {
     role: string;
     alive: boolean;
     nickname: string | null;
+    death_reason?: string | null;
+    death_round?: number | null;
+    killed_by_member_id?: string | null;
   }>;
+  post_game_ready: PostGameReady | null;
 };
 
 export type Snapshot = RoomSnapshot | GameSnapshot;

@@ -25,6 +25,7 @@ create table if not exists public.room_members (
     room_id uuid references public.rooms(id) on delete cascade,
     user_id uuid references public.profiles(id) on delete cascade,
     is_ready boolean default false,
+    post_game_ready boolean not null default false,
     joined_at timestamptz default now(),
     left_at timestamptz,
     primary key(room_id, user_id)
@@ -385,20 +386,28 @@ as $$
         join public.room_members rm on rm.room_id = c.room_id
         where topic = ('room:' || c.room_id::text || ':' || c.name)
           and rm.user_id = auth.uid()
-          and rm.left_at is null
+          and (
+              rm.left_at is null
+              or (r.status = 'CLOSED' and c.name = 'system')
+          )
           and (
               (
                   c.game_id is null
-                  and c.name in ('lobby', 'system')
-                  and r.status = 'WAITING'
+                  and (
+                      (c.name = 'lobby' and r.status = 'WAITING')
+                      or (c.name = 'system' and r.status in ('WAITING', 'POST_GAME', 'CLOSED'))
+                  )
               )
               or (
                   c.game_id is not null
-                  and exists (
-                      select 1
-                      from public.games active_game
-                      where active_game.id = c.game_id
-                        and active_game.ended_at is null
+                  and (
+                      exists (
+                          select 1
+                          from public.games active_game
+                          where active_game.id = c.game_id
+                            and active_game.ended_at is null
+                      )
+                      or r.status = 'POST_GAME'
                   )
                   and (
                       c.name in ('public', 'system')

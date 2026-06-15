@@ -335,7 +335,7 @@ Required functions:
 * `ai_turn` (debug only)
 * `timeout_handler` (snapshot only)
 * `reconnect`
-* `room_action` (`reset_room` for owner-only `POST_GAME -> WAITING`)
+* `room_action` (`set_post_game_ready`, `reset_room` for owner-only `POST_GAME -> WAITING`)
 
 All must:
 
@@ -345,6 +345,10 @@ All must:
 * emit realtime events
 
 `reconnect` must return the same filtered player view as normal gameplay through `getPlayerView(game_id, user_id)`.
+
+POST_GAME uses `room_members.post_game_ready` for replay readiness. Only active room members (`left_at is null`) count; the owner may reset when all active members are ready or force reset to reopen the room.
+
+If the room owner leaves a WAITING or POST_GAME room, the room is dissolved: all active memberships are marked left and the room status becomes `CLOSED`.
 
 ---
 
