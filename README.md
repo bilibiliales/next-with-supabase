@@ -10,6 +10,7 @@ This project is strictly governed by:
 
 * [/docx/00-FROZEN-CONTRACT.md](/docx/00-FROZEN-CONTRACT.md) (PRIMARY SOURCE OF TRUTH)
 * [/docx/01-GAME-STATE-MACHINE-CONTRACT.md](docx/01-GAME-STATE-MACHINE-CONTRACT.md) 
+* [/docx/Frontend-Specification.md](docx/Frontend-Specification.md) 
 * Supabase Edge Functions (SERVER AUTHORITY)
 * PostgreSQL schema (IMMUTABLE BASELINE)
 

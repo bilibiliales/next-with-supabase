@@ -2,7 +2,9 @@
 
 import type { Session, SupabaseClient } from "@supabase/supabase-js";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { edgeFunctionErrorMessage } from "../lib/supabase/function-error";
 import { getSupabase, hasSupabaseEnv } from "../lib/supabase/client";
+import { validatedWolfUsername, wolfEmailFromUsername } from "../lib/wolf/auth";
 import type { ChannelName, GameMessage, GameSnapshot, RoomSnapshot, Snapshot } from "../lib/wolf/types";
 import { isGameSnapshot } from "../lib/wolf/types";
 
@@ -45,7 +47,11 @@ async function invokeFunction<T>(
   body: Record<string, unknown>,
 ): Promise<T> {
   const { data, error } = await supabase.functions.invoke<FunctionEnvelope<T>>(name, { body });
-  if (error) throw new Error(error.message);
+  if (error) {
+    const message =
+      (await edgeFunctionErrorMessage(error)) ?? (error instanceof Error ? error.message : `${name} failed.`);
+    throw new Error(message);
+  }
   if (!data?.ok) throw new Error(data?.error ?? `${name} failed.`);
   return data.data as T;
 }
@@ -84,7 +90,7 @@ export function GameConsole() {
   const [notice, setNotice] = useState<string>("");
   const [error, setError] = useState<string>("");
 
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [roomName, setRoomName] = useState("Wolf table");
   const [maxPlayers, setMaxPlayers] = useState(8);
@@ -211,6 +217,8 @@ export function GameConsole() {
   async function signIn() {
     if (!supabase) return;
     await run("sign-in", async () => {
+      const normalizedUsername = validatedWolfUsername(username);
+      const email = wolfEmailFromUsername(normalizedUsername);
       const { error: authError } = await supabase.auth.signInWithPassword({ email, password });
       if (authError) throw authError;
       setNotice("Signed in.");
@@ -220,7 +228,18 @@ export function GameConsole() {
   async function signUp() {
     if (!supabase) return;
     await run("sign-up", async () => {
-      const { error: authError } = await supabase.auth.signUp({ email, password });
+      const normalizedUsername = validatedWolfUsername(username);
+      const email = wolfEmailFromUsername(normalizedUsername);
+      const { error: authError } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            nickname: normalizedUsername,
+            username: normalizedUsername,
+          },
+        },
+      });
       if (authError) throw authError;
       setNotice("Account created. Sign in if the session did not start automatically.");
     });
@@ -399,8 +418,14 @@ export function GameConsole() {
             <h2>Sign in</h2>
           </div>
           <label>
-            Email
-            <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoComplete="email" />
+            Username
+            <input
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              type="text"
+              autoComplete="username"
+              autoCapitalize="none"
+            />
           </label>
           <label>
             Password
@@ -412,8 +437,8 @@ export function GameConsole() {
             />
           </label>
           <div className="button-row">
-            <button disabled={busy === "sign-in"} onClick={signIn}>Sign in</button>
-            <button className="secondary" disabled={busy === "sign-up"} onClick={signUp}>Create account</button>
+            <button disabled={busy === "sign-in" || !username.trim() || !password} onClick={signIn}>Sign in</button>
+            <button className="secondary" disabled={busy === "sign-up" || !username.trim() || !password} onClick={signUp}>Create account</button>
           </div>
         </section>
       ) : (

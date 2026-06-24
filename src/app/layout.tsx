@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import "../styles.css";
+import "../../styles.css";
 
 export const metadata: Metadata = {
   title: "Wolf AI",

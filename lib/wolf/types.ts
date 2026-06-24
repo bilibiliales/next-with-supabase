@@ -50,6 +50,14 @@ export type GameMessage = {
   created_at: string;
 };
 
+export type GameEvent = {
+  id: number;
+  actor_member_id: string | null;
+  event_type: "game_started" | "vote_resolved" | "night_resolved" | "phase_changed" | "game_ended" | "ai_action_submitted";
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
 export type GameSnapshot = {
   game: {
     id: string;
@@ -81,6 +89,7 @@ export type GameSnapshot = {
   }>;
   channels: ChannelName[];
   messages: GameMessage[];
+  post_game_events: GameEvent[] | null;
   post_game: null | Array<{
     seat_no: number;
     user_id: string | null;

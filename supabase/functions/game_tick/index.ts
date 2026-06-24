@@ -50,9 +50,18 @@ serve(async (req) => {
           gs.phase <> 'waiting'
           and gs.deadline_at <= now()
         )
+        or (
+          gs.phase in ('night', 'day', 'vote')
+          and gs.deadline_at is not null
+          and gs.deadline_at <= now() + interval '120 seconds'
+        )
+        or (
+          gs.phase in ('night', 'day', 'vote', 'settlement')
+          and gs.deadline_at is null
+        )
       )
     order by coalesce(gs.deadline_at, g.started_at) asc nulls last
-    limit 20
+    limit 100
   `;
 
   const results: Record<string, unknown>[] = [];
@@ -78,6 +87,15 @@ serve(async (req) => {
       }
 
       results.push(sanitizeTickResult(result));
+
+      for (const aiResult of result.ai_results) {
+        const messages = [aiResult.private_message, aiResult.message];
+        for (const message of messages) {
+          if (message && typeof message === "object" && "channel" in message) {
+            await broadcastToRoom(result.room_id, String((message as Record<string, unknown>).channel), "message", message as Record<string, unknown>);
+          }
+        }
+      }
 
       if (result.advanced && typeof result.room_id === "string") {
         await broadcastToRoom(result.room_id, "system", "state", {

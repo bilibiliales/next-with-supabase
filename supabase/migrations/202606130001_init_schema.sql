@@ -24,7 +24,7 @@ create table if not exists public.rooms (
 create table if not exists public.room_members (
     room_id uuid references public.rooms(id) on delete cascade,
     user_id uuid references public.profiles(id) on delete cascade,
-    is_ready boolean default false,
+    is_ready boolean not null default false,
     post_game_ready boolean not null default false,
     joined_at timestamptz default now(),
     left_at timestamptz,
